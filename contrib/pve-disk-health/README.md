@@ -38,6 +38,9 @@ A predictive-failure count that keeps rising does not page again: the flag pages
 When a problem goes away, it sends one `info` notice and forgets it.
 
 After removing hardware on purpose, run `pve-disk-health --accept-inventory` to forget it.
+This removes only findings and inventory for confirmed removals. It does not acknowledge new faults or
+advance any other notification baseline. A missing device retains its previous failure until it recovers
+or you accept its removal.
 
 The notification has `type=disk-health` and `hostname=<node name>`, severity `error` or `info`. It carries no details.
 Run `pve-disk-health --show` on the node to see them. PVE has no generic template, so mail targets get PVE's "test"
@@ -106,7 +109,7 @@ for f in pve-disk-health pve-disk-health.service pve-disk-health.timer; do
     "https://raw.githubusercontent.com/trevoraspencer/agent-pager/$c/contrib/pve-disk-health/$f"
 done
 sha256sum --strict -c - <<'SUMS'
-b8b88fef3b71aa2dc243985c650317b74c8921ae77d1f90c124b93eb15145f39  pve-disk-health
+cacc4db7b9a0a858d90c3b1cd83617d6146681abda1cd5ee3fcd7919a71d4b8c  pve-disk-health
 f367c0cb985c1c2c4ad50eaa5d4b4a8ef80c7b206cae4a0ab17628b7ab6f3486  pve-disk-health.service
 2ac8ffc02f35b6f44cca69f98bd83976947c888b37a421aa5f08530af6c976ba  pve-disk-health.timer
 SUMS

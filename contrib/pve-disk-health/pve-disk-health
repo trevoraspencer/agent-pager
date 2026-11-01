@@ -190,7 +190,7 @@ sub perc_query {
     my $cfg = $ctx->{cfg};
     my ($rc, $out) = run_tool($ctx, $cfg->{perccli}, @args, 'J');
     my $ctrls = jarray((jhash(decode_json_safe($out)) // {})->{Controllers});
-    if (!$ctrls || grep { !jhash($_) || !jhash($_->{'Command Status'}) } @$ctrls) {
+    if ($rc != 0 || !$ctrls || grep { !jhash($_) || !jhash($_->{'Command Status'}) } @$ctrls) {
         fail($ctx, 'perc', "check:perccli:$what", "$what query: no usable answer (exit $rc)");
         return undef;
     }
@@ -287,7 +287,7 @@ sub collect_perc {
             if (($st->{Status} // '') eq 'Success') {
                 my $rd = jhash($c->{'Response Data'}) // {};
                 my $groups = $rd->{'FOREIGN CONFIGURATION'};
-                if (defined $groups && !jarray($groups)) {
+                if (!jarray($groups) && ($st->{Description} // '') !~ /no foreign config/i) {
                     fail($ctx, 'perc', "check:perccli:foreign:/c$n", 'foreign query: unexpected answer');
                 } elsif ($groups && @$groups) {
                     $f->{"foreign:/c$n"} = finding(rank => 1, state => scalar(@$groups) . ' foreign drive group(s)');
@@ -429,6 +429,16 @@ sub source_of {
     return undef;
 }
 
+sub inventory_item {
+    my ($key) = @_;
+    return $1 if $key =~ /^gone:(.*)$/;
+    return $key if $key =~ /^(vd|pd):/;
+    return "dev:$1" if $key =~ /^(?:smart:|check:smartctl:)(.*)$/;
+    return "pool:$1" if $key =~ /^thin:(.*)$/;
+    return "ctrl:$1" if $key =~ /^foreign:(.*)$/;
+    return undef;
+}
+
 # Adds "gone" findings for hardware seen before and missing now, and keeps the findings of any
 # source that could not be read completely, so a failed read never looks like a fix.
 sub merge_with_prev {
@@ -446,7 +456,13 @@ sub merge_with_prev {
         $cur->{"gone:$item"} = finding(rank => 3, state => 'no longer seen');
     }
     for my $k (keys %{ $prev->{findings} // {} }) {
-        next if exists $cur->{$k} || $k =~ /^check:/;
+        next if exists $cur->{$k};
+        my $item = inventory_item($k);
+        if (defined $item && exists $pinv->{$item} && !exists $ctx->{inventory}{$item}) {
+            $cur->{$k} = $prev->{findings}{$k};
+            next;
+        }
+        next if $k =~ /^check:/;
         my $src = source_of($k, $pinv) // next;
         $cur->{$k} = $prev->{findings}{$k} if $ctx->{failed}{$src} || $ctx->{carry}{$k};
     }
@@ -520,6 +536,22 @@ sub load_state {
     my $d = jhash(decode_json_safe($text));
     return (undef, 'corrupt') if !$d || !jhash($d->{findings}) || (exists $d->{inventory} && !jhash($d->{inventory}));
     $d->{inventory} //= {};
+    for my $f (values %{ $d->{findings} }) {
+        return (undef, 'corrupt') if !jhash($f)
+            || !defined num($f->{rank}) || !defined $f->{state} || ref($f->{state})
+            || !jarray($f->{flags}) || grep { !defined $_ || ref($_) } @{ $f->{flags} };
+        for my $field (qw(counters paged_counters)) {
+            next if $field eq 'paged_counters' && !exists $f->{$field};
+            return (undef, 'corrupt') if !jhash($f->{$field})
+                || grep { !defined num($_) } values %{ $f->{$field} };
+        }
+        return (undef, 'corrupt') if exists $f->{info} && (!jhash($f->{info})
+            || grep { ref($_) } values %{ $f->{info} });
+        for my $field (qw(level paged_level)) {
+            return (undef, 'corrupt') if defined $f->{$field} && !defined num($f->{$field});
+        }
+    }
+    return (undef, 'corrupt') if grep { !defined $_ || ref($_) || !/^(perc|smart|thin)$/ } values %{ $d->{inventory} };
     $d->{updated} = num($d->{updated}) // 0;
     return ($d, 'ok');
 }
@@ -619,13 +651,20 @@ sub main {
     }
 
     if ($o{'accept-inventory'}) {
-        delete $cur->{$_} for grep { /^gone:/ } keys %$cur;
-        my %keep = %{ $ctx->{inventory} };
+        my %keep;
+        my %findings = %{ $prev->{findings} };
         for my $item (keys %{ $prev->{inventory} }) {
-            $keep{$item} = $prev->{inventory}{$item} if $ctx->{failed}{ $prev->{inventory}{$item} };
+            if (exists $ctx->{inventory}{$item} || $ctx->{failed}{ $prev->{inventory}{$item} }) {
+                $keep{$item} = $prev->{inventory}{$item};
+            } else {
+                for my $key (keys %findings) {
+                    my $owner = inventory_item($key);
+                    delete $findings{$key} if defined $owner && $owner eq $item;
+                }
+            }
         }
-        my (undef, undef, $next) = evaluate($cfg, $prev->{findings}, $cur);
-        save_state($cfg->{state_file}, { findings => $next, inventory => \%keep });
+        save_state($cfg->{state_file}, { findings => \%findings, inventory => \%keep });
+        unlink $cfg->{fallback_state_file} if -e $cfg->{fallback_state_file};
         printf "accepted the current inventory (%d items)\n", scalar keys %keep;
         return 0;
     }
@@ -667,10 +706,11 @@ sub main {
         my $err = $@;
         print STDERR "pve-disk-health: state not saved: $err";
         if (!$write_marker) {
-            notify_ok('error', $node) if !$sent_error;
-            print "sent disk-health error:\n  check:state-write: new (cannot save state)\n";
+            $sent_error = notify_ok('error', $node) if !$sent_error;
+            print "sent disk-health error:\n  check:state-write: new (cannot save state)\n" if $sent_error;
         }
-        $next->{'check:state-write'} = $write_marker // finding(rank => 1, state => 'cannot save state');
+        $next->{'check:state-write'} = $write_marker // finding(rank => 1, state => 'cannot save state')
+            if $write_marker || $sent_error;
         print STDERR "pve-disk-health: fallback state not saved either: $@"
             if !eval { save_state($cfg->{fallback_state_file}, $state); 1 };
         return 1;

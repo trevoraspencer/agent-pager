@@ -216,6 +216,8 @@ drop_drive(2);
 $out = run_check();
 is(errors(), 1, 'a failing drive that disappears pages');
 like($out, qr{gone:pd:/c0/e252/s2: new}, 'the missing drive is named');
+is(infos(), 0, 'a missing failed drive does not send a false recovery');
+ok(saved()->{findings}{'pd:/c0/e252/s2'}, 'the missing drive retains its original failure');
 ok(saved()->{findings}{'gone:pd:/c0/e252/s2'}, 'gone finding saved');
 run_check();
 is(scalar @calls, 0, 'a drive still missing does not page again');
@@ -431,6 +433,68 @@ is(scalar @$w, 2, 'unknown key and bad number are warned');
 $f = PVEDiskHealth::collect($c)->{findings};
 ok(!grep({ /^thin:|^foreign:/ } keys %$f), 'ignore drops matching keys');
 ok(!eval { PVEDiskHealth::read_config("$tmp/missing.conf", 1) }, 'a named config that is missing is an error');
+
+# ---- second-review regressions
+fresh();
+drop_drive(2);
+$world{smart}{'/dev/nvme9'}{smart_status}{passed} = JSON::PP::false;
+my $prior_smart = saved()->{findings}{'smart:/dev/bus/9:megaraid,4'};
+$world{smart}{'/dev/bus/9'}{scsi_grown_defect_list} += 20;
+run_check('--accept-inventory');
+is(scalar @calls, 0, 'accept inventory never notifies');
+ok(!saved()->{findings}{'smart:/dev/nvme9:nvme'}, 'accept does not acknowledge a new unrelated fault');
+is_deeply(saved()->{findings}{'smart:/dev/bus/9:megaraid,4'}, $prior_smart,
+    'accept leaves existing notification baselines untouched');
+ok(!saved()->{findings}{'pd:/c0/e252/s2'}, 'accept removes the absent drive failure');
+$out = run_check();
+like($out, qr{smart:/dev/nvme9:nvme: new}, 'the unrelated SMART failure still pages next run');
+like($out, qr{grown_defects 88 -> 108}, 'an unrelated counter rise still pages next run');
+
+for my $bad (
+    { 'smart:/dev/nvme9:nvme' => 1 },
+    { bad => { rank => [], state => 'bad', flags => [], counters => {} } },
+    { bad => { rank => 1, state => 'bad', flags => {}, counters => {} } },
+    { bad => { rank => 1, state => 'bad', flags => [], counters => { errors => [] } } },
+    { bad => { rank => 1, state => 'bad', flags => [], counters => {}, paged_counters => [] } },
+) {
+    fresh();
+    open(my $fh, '>', $state) or die;
+    print $fh $enc->encode({ findings => $bad, inventory => {} });
+    close $fh;
+    ($out, $rc) = run_check();
+    is($rc, 0, 'invalid nested state is recovered without crashing');
+    like($out, qr/check:state: new/, 'invalid nested state pages as corrupt');
+}
+
+fresh();
+chmod 0500, $sdir;
+$notify_dies = 1;
+($out, $rc) = run_check();
+is($rc, 1, 'failed state-write notification exits nonzero');
+unlike($out, qr/sent disk-health error/, 'failed notification is not claimed as sent');
+my ($fbstate) = PVEDiskHealth::load_state($fallback);
+ok(!$fbstate->{findings}{'check:state-write'}, 'failed notification is not acknowledged in fallback');
+$notify_dies = 0;
+run_check();
+is(errors(), 1, 'state-write notification retries after failed send');
+run_check();
+is(errors(), 0, 'successful state-write notification is deduplicated');
+chmod 0700, $sdir;
+
+for my $case (
+    [124, { Controllers => [{ 'Command Status' => { Status => 'Success', Controller => 0 } }] }],
+    [3, fixture('perccli-fall.json')],
+    [0, { Controllers => [{ 'Command Status' => { Status => 'Success', Controller => 0 } }] }],
+) {
+    reset_world();
+    ($world{fall_rc}, $world{fall}) = @$case;
+    ok(grep({ /^check:perccli:foreign/ } keys %{ found() }),
+        'foreign query rejects error exits or missing response data, even with Success JSON');
+}
+reset_world();
+$world{fall}{Controllers}[0]{'Response Data'}{'FOREIGN CONFIGURATION'} = [];
+ok(!grep({ /^check:perccli:foreign|^foreign:/ } keys %{ found() }), 'a valid empty foreign list is accepted');
+write_conf();
 
 # ---- the README install block lists the current checksums
 {
