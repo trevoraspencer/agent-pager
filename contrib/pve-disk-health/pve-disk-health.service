@@ -1,0 +1,19 @@
+[Unit]
+Description=Check disks, RAID volumes and thin pools; notify on new or worse problems
+Documentation=https://github.com/trevoraspencer/agent-pager/tree/main/contrib/pve-disk-health
+After=pve-cluster.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pve-disk-health
+StateDirectory=pve-disk-health
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/pve-disk-health
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=300
+# Read-only /usr, /boot and /etc. Not "strict": LVM needs its lock files under /run,
+# and the mail target needs the Postfix spool.
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes

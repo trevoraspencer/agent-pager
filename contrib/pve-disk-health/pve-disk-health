@@ -1,0 +1,477 @@
+#!/usr/bin/perl
+# pve-disk-health: page once when a disk, RAID volume or LVM thin pool on a
+# Proxmox VE node goes bad or gets worse. Read-only. Runs from a systemd timer.
+package PVEDiskHealth;
+
+use strict;
+use warnings;
+
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
+use Getopt::Long qw(GetOptionsFromArray);
+use JSON::PP;
+
+our $VERSION = '0.1.0';
+
+our %DEFAULTS = (
+    counter_step   => 10,
+    thin_data_warn => 90,
+    thin_data_step => 2,
+    thin_meta_warn => 80,
+    nvme_used_warn => 90,
+    perccli        => '/opt/MegaRAID/perccli/perccli64',
+    smartctl       => 'smartctl',
+    lvs            => 'lvs',
+    cmd_timeout    => 60,
+    state_file     => '/var/lib/pve-disk-health/state.json',
+    ignore         => '',
+);
+my %NUMERIC = map { $_ => 1 } qw(counter_step thin_data_warn thin_data_step thin_meta_warn nvme_used_warn cmd_timeout);
+
+our $CONFIG_FILE = '/etc/pve-disk-health.conf';
+
+# Hooks, so the tests can run without hardware or PVE.
+our $RUN          = \&run_cmd;
+our $NOTIFY       = \&pve_notify;
+our $NODENAME     = \&pve_nodename;
+our $HAS_MEGARAID = sub { -d '/sys/module/megaraid_sas' };
+our $IS_EXEC      = sub { my ($p) = @_; return -x $p };
+
+my $JSON = JSON::PP->new->canonical(1)->pretty(1);
+
+# ---------------------------------------------------------------- helpers
+
+sub run_cmd {
+    my ($cfg, @argv) = @_;
+    my $out = '';
+    my $pid = open(my $fh, '-|');
+    return (127, '') if !defined $pid;
+    if (!$pid) {
+        open(STDERR, '>', '/dev/null');
+        exec('timeout', $cfg->{cmd_timeout}, @argv) or exit 127;
+    }
+    local $/;
+    $out = <$fh> // '';
+    close($fh);
+    return ($? >> 8, $out);
+}
+
+sub pve_nodename {
+    require PVE::INotify;
+    return PVE::INotify::nodename();
+}
+
+sub pve_notify {
+    my ($severity, $hostname) = @_;
+    require PVE::Notify;
+    my $fields = { type => 'disk-health', hostname => $hostname };
+    # PVE ships no generic template; "test" renders without extra data.
+    my $data = { target => 'pve-disk-health' };
+    if ($severity eq 'error') {
+        PVE::Notify::error('test', $data, $fields);
+    } else {
+        PVE::Notify::info('test', $data, $fields);
+    }
+}
+
+sub decode_json_safe {
+    my ($text) = @_;
+    my $d = eval { JSON::PP->new->decode($text) };
+    return $d;
+}
+
+sub read_config {
+    my ($file, $required) = @_;
+    my %cfg = %DEFAULTS;
+    my @warn;
+    if (!-e $file) {
+        die "config file '$file' not found\n" if $required;
+        return (\%cfg, \@warn);
+    }
+    open(my $fh, '<', $file) or die "cannot read config '$file': $!\n";
+    while (my $line = <$fh>) {
+        chomp $line;
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '' || $line =~ /^#/;
+        my ($k, $v) = $line =~ /^([a-z_]+)\s*=\s*(.*)$/;
+        if (!defined $k || !exists $DEFAULTS{$k}) {
+            push @warn, "config: ignoring line '$line'";
+            next;
+        }
+        if ($NUMERIC{$k} && $v !~ /^\d+(\.\d+)?$/) {
+            push @warn, "config: '$k' must be a number, keeping $DEFAULTS{$k}";
+            next;
+        }
+        $cfg{$k} = $v;
+    }
+    close($fh);
+    return (\%cfg, \@warn);
+}
+
+sub ignored {
+    my ($cfg, $key) = @_;
+    for my $pat (split /[\s,]+/, $cfg->{ignore} // '') {
+        next if $pat eq '';
+        if ($pat =~ /^(.*)\*$/) {
+            return 1 if index($key, $1) == 0;
+        } elsif ($key eq $pat) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+sub finding {
+    my (%f) = @_;
+    return {
+        rank     => $f{rank} // 0,
+        state    => $f{state} // '',
+        flags    => [sort @{ $f{flags} // [] }],
+        counters => $f{counters} // {},
+        level    => $f{level},
+        info     => $f{info} // {},
+    };
+}
+
+# ---------------------------------------------------------------- PERC
+
+my %VD_RANK = (Optl => 0, Pdgd => 1, Dgrd => 2, Offln => 3);
+my %PD_OK   = map { $_ => 1 } qw(Onln UGood GHS DHS JBOD);
+my %PD_MID  = map { $_ => 1 } qw(Rbld Cpybck);
+
+sub perc_controllers {
+    my ($cfg, $f, $what, @args) = @_;
+    my ($rc, $out) = $RUN->($cfg, $cfg->{perccli}, @args, 'J');
+    my $d = decode_json_safe($out);
+    if (!$d || ref($d->{Controllers}) ne 'ARRAY') {
+        $f->{"check:perccli"} = finding(rank => 1, state => "$what: no JSON (exit $rc)");
+        return ();
+    }
+    return @{ $d->{Controllers} };
+}
+
+sub collect_perc {
+    my ($cfg, $f) = @_;
+    if (!$IS_EXEC->($cfg->{perccli})) {
+        $f->{"check:perccli"} = finding(rank => 1, state => 'MegaRAID controller found but perccli is not installed')
+            if $HAS_MEGARAID->();
+        return;
+    }
+
+    for my $c (perc_controllers($cfg, $f, 'vd', '/call/vall', 'show', 'all')) {
+        my $st = $c->{'Command Status'} // {};
+        my $rd = $c->{'Response Data'} // {};
+        if (($st->{Status} // '') ne 'Success') {
+            my $desc = $st->{Description} // '';
+            next if $desc =~ /no vds? (have been )?configured/i;
+            $f->{"check:perccli"} = finding(rank => 1, state => 'vd: command status not Success');
+            next;
+        }
+        for my $k (sort keys %$rd) {
+            next if $k !~ m{^/c\d+/v\d+$} || ref($rd->{$k}) ne 'ARRAY';
+            my $vd = $rd->{$k}[0] // {};
+            my $state = $vd->{State} // '?';
+            my $rank = $VD_RANK{$state} // 2;
+            my @flags;
+            push @flags, 'inconsistent' if ($vd->{Consist} // '') eq 'No';
+            next if !$rank && !@flags;
+            $f->{"vd:$k"} = finding(rank => $rank, state => "VD $state", flags => \@flags);
+        }
+    }
+
+    for my $c (perc_controllers($cfg, $f, 'pd', '/call/eall/sall', 'show', 'all')) {
+        my $st = $c->{'Command Status'} // {};
+        my $rd = $c->{'Response Data'} // {};
+        if (($st->{Status} // '') ne 'Success') {
+            $f->{"check:perccli"} = finding(rank => 1, state => 'pd: command status not Success');
+            next;
+        }
+        for my $k (sort keys %$rd) {
+            my ($id) = $k =~ m{^Drive (/c\d+/e\d+/s\d+)$};
+            next if !$id || ref($rd->{$k}) ne 'ARRAY';
+            my $pd = $rd->{$k}[0] // {};
+            my $state = $pd->{State} // '?';
+            my $rank = $PD_OK{$state} ? 0 : $PD_MID{$state} ? 1 : 2;
+            my $det = ($rd->{"Drive $id - Detailed Information"} // {})->{"Drive $id State"} // {};
+            my $media = $det->{'Media Error Count'} // 0;
+            my $other = $det->{'Other Error Count'} // 0;
+            my $pf    = $det->{'Predictive Failure Count'} // 0;
+            my $smart = $det->{'S.M.A.R.T alert flagged by drive'} // 'No';
+            my @flags;
+            push @flags, 'predictive_failure' if $pf =~ /^\d+$/ && $pf > 0;
+            push @flags, 'smart_alert' if $smart eq 'Yes';
+            my %cnt;
+            $cnt{media_errors} = $media + 0 if $media =~ /^\d+$/ && $media > 0;
+            $cnt{other_errors} = $other + 0 if $other =~ /^\d+$/ && $other > 0;
+            next if !$rank && !@flags && !%cnt;
+            $f->{"pd:$id"} = finding(
+                rank => $rank, state => "PD $state", flags => \@flags, counters => \%cnt,
+                info => { predictive_failure_count => $pf },
+            );
+        }
+    }
+
+    my ($rc, $out) = $RUN->($cfg, $cfg->{perccli}, '/call/fall', 'show', 'J');
+    my $d = decode_json_safe($out);
+    # A controller without a foreign config may report a failure status here; only a listed group counts.
+    for my $c (@{ ($d // {})->{Controllers} // [] }) {
+        my $groups = ($c->{'Response Data'} // {})->{'FOREIGN CONFIGURATION'};
+        next if ref($groups) ne 'ARRAY' || !@$groups;
+        my $n = $c->{'Command Status'}{Controller} // 0;
+        $f->{"foreign:/c$n"} = finding(rank => 1, state => scalar(@$groups) . ' foreign drive group(s)');
+    }
+}
+
+# ---------------------------------------------------------------- SMART
+
+sub collect_smart {
+    my ($cfg, $f) = @_;
+    my ($rc, $out) = $RUN->($cfg, $cfg->{smartctl}, '--scan-open', '-j');
+    my $scan = decode_json_safe($out);
+    if (!$scan || ref($scan->{devices}) ne 'ARRAY') {
+        $f->{"check:smartctl"} = finding(rank => 1, state => "scan: no JSON (exit $rc)");
+        return;
+    }
+    for my $dev (@{ $scan->{devices} }) {
+        next if $dev->{open_error};
+        my ($name, $type) = ($dev->{name}, $dev->{type});
+        next if !defined $name || !defined $type;
+        my ($drc, $dout) = $RUN->($cfg, $cfg->{smartctl}, '-j', '-H', '-A', '-d', $type, $name);
+        my $d = decode_json_safe($dout);
+        my $key = "smart:$name:$type";
+        # smartctl exit bits 0 and 1 mean the command or the device open failed.
+        if (!$d || ($drc & 3)) {
+            $f->{"check:smartctl"} = finding(rank => 1, state => "query failed (exit $drc)");
+            next;
+        }
+        my (@flags, %cnt, %info);
+        push @flags, 'smart_failed' if ref($d->{smart_status}) eq 'HASH' && !$d->{smart_status}{passed};
+
+        if (defined(my $g = $d->{scsi_grown_defect_list})) {
+            $cnt{grown_defects} = $g + 0 if $g > 0;
+        }
+        my $log = $d->{scsi_error_counter_log} // {};
+        for my $op (qw(read write verify)) {
+            my $u = ($log->{$op} // {})->{total_uncorrected_errors};
+            $cnt{"${op}_uncorrected"} = $u + 0 if defined $u && $u > 0;
+        }
+        my %ata = (5 => 'reallocated', 197 => 'pending', 198 => 'offline_uncorrectable');
+        for my $a (@{ ($d->{ata_smart_attributes} // {})->{table} // [] }) {
+            my $n = $ata{ $a->{id} // -1 } or next;
+            my $v = ($a->{raw} // {})->{value} // 0;
+            $cnt{$n} = $v + 0 if $v > 0;
+        }
+        if (my $nv = $d->{nvme_smart_health_information_log}) {
+            push @flags, 'nvme_critical_warning' if ($nv->{critical_warning} // 0) != 0;
+            my $used = $nv->{percentage_used} // 0;
+            $info{percentage_used} = $used;
+            push @flags, 'nvme_wear' if $used >= $cfg->{nvme_used_warn};
+            $cnt{media_errors} = $nv->{media_errors} + 0 if ($nv->{media_errors} // 0) > 0;
+        }
+        next if !@flags && !%cnt;
+        $f->{$key} = finding(state => 'SMART', flags => \@flags, counters => \%cnt, info => \%info);
+    }
+}
+
+# ---------------------------------------------------------------- thin pools
+
+sub collect_thin {
+    my ($cfg, $f) = @_;
+    my ($rc, $out) = $RUN->($cfg, $cfg->{lvs}, '--reportformat', 'json',
+        '-o', 'vg_name,lv_name,lv_attr,data_percent,metadata_percent');
+    my $d = decode_json_safe($out);
+    if ($rc != 0 || !$d || ref($d->{report}) ne 'ARRAY') {
+        $f->{"check:lvs"} = finding(rank => 1, state => "lvs failed (exit $rc)");
+        return;
+    }
+    for my $lv (map { @{ $_->{lv} // [] } } @{ $d->{report} }) {
+        next if ($lv->{lv_attr} // '') !~ /^t/;
+        my $data = $lv->{data_percent} // '';
+        my $meta = $lv->{metadata_percent} // '';
+        next if $data !~ /^\d+(\.\d+)?$/;
+        my ($warn, $step) = ($cfg->{thin_data_warn}, $cfg->{thin_data_step});
+        my $level;
+        $level = $warn + $step * int(($data - $warn) / $step) if $data >= $warn;
+        my @flags;
+        push @flags, 'metadata_high' if $meta =~ /^\d+(\.\d+)?$/ && $meta >= $cfg->{thin_meta_warn};
+        next if !defined $level && !@flags;
+        $f->{"thin:$lv->{vg_name}/$lv->{lv_name}"} = finding(
+            state => 'thin pool', flags => \@flags, level => $level,
+            info => { data_percent => $data + 0, metadata_percent => ($meta eq '' ? undef : $meta + 0) },
+        );
+    }
+}
+
+sub collect {
+    my ($cfg) = @_;
+    my %f;
+    collect_perc($cfg, \%f);
+    collect_smart($cfg, \%f);
+    collect_thin($cfg, \%f);
+    delete $f{$_} for grep { ignored($cfg, $_) } keys %f;
+    return \%f;
+}
+
+# ---------------------------------------------------------------- compare
+
+sub evaluate {
+    my ($cfg, $prev, $cur) = @_;
+    my (@page, @cleared, %next);
+    my $step = $cfg->{counter_step};
+
+    for my $k (sort keys %$cur) {
+        my $c = $cur->{$k};
+        my $p = $prev->{$k};
+        my %n = (%$c);
+        if (!$p) {
+            push @page, "$k: new";
+            $n{paged_counters} = { %{ $c->{counters} } };
+            $n{paged_level} = $c->{level};
+            $next{$k} = \%n;
+            next;
+        }
+        my @why;
+        push @why, "$k: worse ($p->{state} -> $c->{state})" if $c->{rank} > ($p->{rank} // 0);
+        my %had = map { $_ => 1 } @{ $p->{flags} // [] };
+        push @why, "$k: $_" for grep { !$had{$_} } @{ $c->{flags} };
+
+        my %paged = %{ $p->{paged_counters} // {} };
+        for my $name (sort keys %{ $c->{counters} }) {
+            my $now  = $c->{counters}{$name};
+            my $base = $paged{$name} // 0;
+            push @why, "$k: $name $base -> $now" if ($base == 0 && $now > 0) || $now >= $base + $step;
+        }
+        my $pl = $p->{paged_level};
+        push @why, "$k: level $c->{level}" if defined $c->{level} && (!defined $pl || $c->{level} > $pl);
+
+        if (@why) {
+            push @page, @why;
+            $n{paged_counters} = { %{ $c->{counters} } };
+            $n{paged_level} = $c->{level};
+        } else {
+            # A counter that went down (controller reset) or a level that fell must be able to page again.
+            for my $name (keys %paged) {
+                my $now = $c->{counters}{$name} // 0;
+                $paged{$name} = $now if $now < $paged{$name};
+            }
+            $n{paged_counters} = \%paged;
+            $n{paged_level} = (defined $pl && defined $c->{level} && $c->{level} < $pl) ? $c->{level}
+                : defined $c->{level} ? $pl : undef;
+        }
+        $next{$k} = \%n;
+    }
+    for my $k (sort keys %$prev) {
+        push @cleared, $k if !$cur->{$k} && !ignored($cfg, $k);
+    }
+    return (\@page, \@cleared, \%next);
+}
+
+# ---------------------------------------------------------------- state
+
+sub load_state {
+    my ($file) = @_;
+    return undef if !-e $file;
+    open(my $fh, '<', $file) or return undef;
+    local $/;
+    my $d = decode_json_safe(<$fh> // '');
+    close($fh);
+    return (ref($d) eq 'HASH' && ref($d->{findings}) eq 'HASH') ? $d->{findings} : undef;
+}
+
+sub save_state {
+    my ($file, $findings) = @_;
+    my $dir = dirname($file);
+    make_path($dir, { mode => 0700 }) if !-d $dir;
+    my $tmp = "$file.tmp.$$";
+    my $old = umask(077);
+    open(my $fh, '>', $tmp) or do { umask($old); die "cannot write '$tmp': $!\n" };
+    print $fh $JSON->encode({ version => 1, updated => time(), findings => $findings });
+    close($fh) or die "cannot write '$tmp': $!\n";
+    umask($old);
+    rename($tmp, $file) or die "cannot rename '$tmp': $!\n";
+}
+
+# ---------------------------------------------------------------- output
+
+sub describe {
+    my ($k, $f) = @_;
+    my @p = ($f->{state});
+    push @p, 'flags=' . join(',', @{ $f->{flags} }) if @{ $f->{flags} };
+    push @p, join(' ', map { "$_=$f->{counters}{$_}" } sort keys %{ $f->{counters} }) if %{ $f->{counters} };
+    push @p, "level>=$f->{level}%" if defined $f->{level};
+    for my $i (sort keys %{ $f->{info} // {} }) {
+        push @p, "$i=$f->{info}{$i}" if defined $f->{info}{$i};
+    }
+    return "  $k: " . join('; ', grep { defined && $_ ne '' } @p);
+}
+
+sub usage {
+    return <<'EOT';
+Usage: pve-disk-health [--show | --dry-run | --test] [--baseline-quiet] [--config FILE] [--state FILE]
+
+  (no option)       check, push only what is new or worse, save the state
+  --show            print the current findings and what would push; send and save nothing
+  --dry-run         same compare as a normal run; print, but send and save nothing
+  --test            send one disk-health error marked as a test; the state is not read or changed
+  --baseline-quiet  on the first run (no state yet), save the baseline without a push
+EOT
+}
+
+sub main {
+    my (@args) = @_;
+    my %o;
+    my $ok = GetOptionsFromArray(\@args, \%o,
+        'show', 'dry-run', 'test', 'baseline-quiet', 'config=s', 'state=s', 'help', 'version');
+    if (!$ok || @args) { print STDERR usage(); return 2; }
+    if ($o{help})    { print usage(); return 0; }
+    if ($o{version}) { print "pve-disk-health $VERSION\n"; return 0; }
+
+    my ($cfg, $warn) = eval { read_config($o{config} // $CONFIG_FILE, defined $o{config}) };
+    if (!$cfg) { print STDERR "pve-disk-health: $@"; return 2; }
+    print STDERR "pve-disk-health: $_\n" for @$warn;
+    $cfg->{state_file} = $o{state} if defined $o{state};
+
+    my $node = $NODENAME->();
+
+    if ($o{test}) {
+        $NOTIFY->('error', "$node disk-health test");
+        print "sent a disk-health test notification for $node\n";
+        return 0;
+    }
+
+    my $cur = collect($cfg);
+    my $prev = load_state($cfg->{state_file});
+    my $first = !defined $prev;
+    my ($page, $cleared, $next) = evaluate($cfg, $prev // {}, $cur);
+
+    if ($o{show} || $o{'dry-run'}) {
+        if ($o{show}) {
+            print "findings on $node:\n";
+            print %$cur ? join("\n", map { describe($_, $cur->{$_}) } sort keys %$cur) . "\n" : "  none\n";
+        }
+        if (@$page && !($first && $o{'baseline-quiet'})) {
+            print "would send a disk-health error:\n", map { "  $_\n" } @$page;
+        } else {
+            print "nothing new to send\n";
+        }
+        print "would send a cleared notice (info, no push): ", join(', ', @$cleared), "\n" if @$cleared;
+        return 0;
+    }
+
+    if (@$page && !($first && $o{'baseline-quiet'})) {
+        $NOTIFY->('error', $node);
+        print "sent disk-health error:\n", map { "  $_\n" } @$page;
+    } elsif ($first && $o{'baseline-quiet'}) {
+        print "saved the baseline without a push (" . scalar(keys %$cur) . " findings)\n";
+    }
+    if (@$cleared) {
+        $NOTIFY->('info', $node);
+        print "cleared: ", join(', ', @$cleared), "\n";
+    }
+    save_state($cfg->{state_file}, $next);
+    return 0;
+}
+
+exit(main(@ARGV)) if !caller;
+
+1;

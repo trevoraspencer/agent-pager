@@ -1,0 +1,11 @@
+{
+  "Controllers": [
+    {
+      "Command Status": {
+        "Controller": 0,
+        "Status": "Failure",
+        "Description": "No foreign configuration found"
+      }
+    }
+  ]
+}

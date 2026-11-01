@@ -1,0 +1,21 @@
+{
+  "Controllers": [
+    {
+      "Command Status": {
+        "Controller": 0,
+        "Status": "Success",
+        "Description": "Operation on foreign configuration Succeeded"
+      },
+      "Response Data": {
+        "FOREIGN CONFIGURATION": [
+          {
+            "DG": 0,
+            "Size": "1.0 TB",
+            "State": "Frgn",
+            "Type": "RAID10"
+          }
+        ]
+      }
+    }
+  ]
+}
