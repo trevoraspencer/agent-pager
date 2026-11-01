@@ -2,8 +2,10 @@
 import fcntl
 import importlib.machinery
 import importlib.util
+import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,6 +18,14 @@ from pathlib import Path
 PAGE = Path(__file__).with_name("page")
 BARK_KEY = "barkkeybarkkeybarkkeybark"
 NTFY_TOPIC = "topic-topic-topic-topic"
+ENC_KEY = "Kq7vT2xN9pLm4RsW8yBc3HdF6jGz5AeU"
+
+
+def load_page():
+    loader = importlib.machinery.SourceFileLoader("page_module", str(PAGE))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("page_module", loader))
+    loader.exec_module(module)
+    return module
 
 
 class FakeServer(HTTPServer):
@@ -41,7 +51,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-class PageTest(unittest.TestCase):
+class ServerTest(unittest.TestCase):
     def setUp(self):
         self.server = FakeServer()
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -79,11 +89,12 @@ class PageTest(unittest.TestCase):
     def backends(self):
         return [request["backend"] for request in self.server.requests]
 
+
+class PageTest(ServerTest):
+
     def test_this_machines_own_name_stays_readable(self):
         name = "DavidMacSudioM1s-Mac-Studio"
-        loader = importlib.machinery.SourceFileLoader("page_module", str(PAGE))
-        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("page_module", loader))
-        loader.exec_module(module)
+        module = load_page()
         with unittest.mock.patch("socket.gethostname", return_value=f"{name}.local"):
             self.assertEqual(module.mask(f"page test from {name}"), f"page test from {name}")
             self.assertEqual(module.mask("x DavidMacSudioM1s-Mac-Studio7 y"), "x [masked] y")
@@ -224,6 +235,8 @@ class PageTest(unittest.TestCase):
             '{"windows": 5}',
             '{"backends": []}',
             '{"routes": {"wake": [[]]}}',
+            '{"backends": {"bark": {"max_level": "loud"}}}',
+            '{"backends": {"bark": {"encrypt_key_file": ""}}}',
         )
         for number, text in enumerate(cases):
             with self.subTest(text=text):
@@ -460,6 +473,162 @@ class PageTest(unittest.TestCase):
         output = self.page("status").stdout
         self.assertIn("bark: set up", output)
         self.assertIn("ntfy: no secret file", output)
+
+
+class AesTest(unittest.TestCase):
+    def setUp(self):
+        self.module = load_page()
+
+    def test_fips_197_aes_256_block(self):
+        round_keys = self.module._round_keys(bytes(range(32)))
+        block = self.module._encrypt_block(round_keys, list(bytes.fromhex("00112233445566778899aabbccddeeff")))
+        self.assertEqual(bytes(block).hex(), "8ea2b7ca516745bfeafc49904b496089")
+
+    def test_nist_sp_800_38a_cbc_aes_256(self):
+        key = bytes.fromhex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4")
+        plain = bytes.fromhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
+        # Padding adds a third block; the first two are the published vector.
+        out = self.module.aes_cbc_encrypt(key, bytes(range(16)), plain)
+        self.assertEqual(out[:32].hex(), "f58c4c04d6e5f1ba779eabfb5f7bfbd69cfc4e967edb808d679f777bc6702c7d")
+        self.assertEqual(len(out), 48)
+
+    def test_barks_published_sample(self):
+        plain = b'{"body": "test", "sound": "birdsong"}'
+        out = self.module.aes_cbc_encrypt(b"1234567890123456", b"1111111111111111", plain)
+        expected = "d3QhjQjP5majvNt5CjsvFWwqqj2gKl96RFj5OO+u6ynTt7lkyigDYNA3abnnCLpr"
+        self.assertEqual(base64.b64encode(out).decode(), expected)
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl not installed")
+    def test_openssl_decrypts_every_key_size(self):
+        for size in (16, 24, 32):
+            with self.subTest(size=size):
+                key, iv = ENC_KEY[:size].encode(), b"abcdefgh12345678"
+                plain = "{\"title\": \"caf\u00e9\", \"body\": \"" + "x" * size + "\"}"
+                out = self.module.aes_cbc_encrypt(key, iv, plain.encode())
+                self.assertEqual(openssl_decrypt(key, iv, out), plain.encode())
+
+
+def openssl_decrypt(key, iv, ciphertext):
+    command = ["openssl", "enc", "-d", f"-aes-{len(key) * 8}-cbc", "-K", key.hex(), "-iv", iv.hex()]
+    return subprocess.run(command, input=ciphertext, capture_output=True, check=True).stdout
+
+
+class EncryptedBarkTest(ServerTest):
+    def setUp(self):
+        super().setUp()
+        (self.root / "config/secrets/ntfy-topic").unlink()
+        self.set_secret("bark-enc-key", ENC_KEY)
+        os.chmod(self.root / "config/secrets/bark-enc-key", 0o600)
+
+    def sent(self, index=-1):
+        request = self.server.requests[index]
+        return request, json.loads(request["body"])
+
+    def decrypted(self, body):
+        return json.loads(openssl_decrypt(ENC_KEY.encode(), body["iv"].encode(), base64.b64decode(body["ciphertext"])))
+
+    def test_only_the_device_key_ciphertext_and_iv_leave_the_machine(self):
+        result = self.page("--url", "https://example.test/card", "backup failed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        request, body = self.sent()
+        self.assertEqual(request["secret"], "push")
+        self.assertEqual(sorted(body), ["ciphertext", "device_key", "iv"])
+        self.assertEqual(body["device_key"], BARK_KEY)
+        self.assertEqual(len(body["iv"]), 16)
+        raw = request["body"].decode()
+        for visible in ("backup failed", "example.test", "page-info", "active"):
+            self.assertNotIn(visible, raw)
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl not installed")
+    def test_ciphertext_decrypts_to_the_usual_bark_fields(self):
+        self.page("--url", "https://example.test/card", "backup failed")
+        self.assertEqual(self.decrypted(self.sent()[1]), {
+            "title": f"info: {load_page().short_hostname()}", "body": "backup failed", "group": "page-info",
+            "level": "active", "url": "https://example.test/card",
+        })
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl not installed")
+    def test_a_wake_rings_from_inside_the_ciphertext(self):
+        self.page("--sev", "wake", "lead is down")
+        plain = self.decrypted(self.sent()[1])
+        self.assertEqual((plain["level"], plain["call"], plain["volume"]), ("critical", "1", 5))
+
+    def test_each_push_gets_a_new_iv(self):
+        self.page("--window", "0", "one")
+        self.page("--window", "0", "one")
+        self.assertNotEqual(self.sent(0)[1]["iv"], self.sent(1)[1]["iv"])
+        self.assertNotEqual(self.sent(0)[1]["ciphertext"], self.sent(1)[1]["ciphertext"])
+
+    def test_an_unusable_key_never_falls_back_to_plain_text(self):
+        for name, value in (("short", "tooshort"), ("space", "Kq7vT2xN9pLm4RsW 8yBc3HdF6jGz5Ae"), ("empty", "")):
+            with self.subTest(name=name):
+                self.set_secret("bark-enc-key", value)
+                result = self.page("--window", "0", "backup failed")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("bark: encryption key unusable", result.stderr)
+                self.assertEqual(self.server.requests, [])
+
+    def test_an_unreadable_key_never_falls_back_to_plain_text(self):
+        key_file = self.root / "config/secrets/bark-enc-key"
+        key_file.unlink()
+        key_file.mkdir()
+        result = self.page("backup failed")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("bark: encryption key unusable", result.stderr)
+        self.assertEqual(self.server.requests, [])
+        status = self.page("status")
+        self.assertIn("will not send", status.stdout)
+        self.assertEqual(status.returncode, 1)
+
+    def test_an_unusable_key_still_lets_another_backend_send(self):
+        self.set_secret("ntfy-topic", NTFY_TOPIC)
+        self.set_secret("bark-enc-key", "tooshort")
+        result = self.page("--sev", "wake", "lead is down")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.backends(), ["ntfy"])
+
+    def test_the_encryption_key_never_reaches_output_log_or_wire(self):
+        sent = self.page("--sev", "wake", "lead is down")
+        status = self.page("status")
+        self.set_secret("bark-enc-key", ENC_KEY[:20])
+        failed = self.page("--window", "0", "x")
+        log = (self.root / "state/sent.jsonl").read_text()
+        wire = b"".join(request["body"] for request in self.server.requests).decode()
+        for text in (sent.stdout, sent.stderr, status.stdout, status.stderr, failed.stdout, failed.stderr, log, wire):
+            self.assertNotIn(ENC_KEY[:16], text)
+
+    def test_status_says_encrypted_and_warns_about_open_permissions(self):
+        self.assertIn("bark: set up, encrypted", self.page("status").stdout)
+        os.chmod(self.root / "config/secrets/bark-enc-key", 0o644)
+        self.assertIn("readable by other users", self.page("status").stdout)
+        result = self.page("backup failed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("readable by other users", result.stderr)
+        (self.root / "config/secrets/bark-enc-key").unlink()
+        self.assertIn("bark: set up, NOT encrypted", self.page("status").stdout)
+
+
+class MaxLevelTest(ServerTest):
+    def test_a_capped_wake_does_not_ring_or_use_up_the_wake_cap(self):
+        self.write_config({"wake_cap_per_hour": 1, "backends": {"bark": {"max_level": "active"}}})
+        first = self.page("--sev", "wake", "lead is down")
+        self.assertIn("via bark, level capped, did not ring", first.stdout)
+        body = json.loads(self.server.requests[0]["body"])
+        self.assertEqual(body["level"], "active")
+        self.assertNotIn("call", body)
+        self.assertNotIn("volume", body)
+        self.page("--sev", "wake", "prod tripped")
+        self.assertEqual(self.backends(), ["bark", "bark"])
+
+    def test_time_sensitive_cap(self):
+        self.write_config({"backends": {"bark": {"max_level": "timeSensitive"}}})
+        self.page("--sev", "wake", "lead is down")
+        self.assertEqual(json.loads(self.server.requests[0]["body"])["level"], "timeSensitive")
+        self.assertIn("max level timeSensitive", self.page("status").stdout)
+
+    def test_info_is_unchanged_by_the_cap(self):
+        self.write_config({"routes": {"info": ["bark"]}, "backends": {"bark": {"max_level": "active"}}})
+        self.assertEqual(self.page("build finished").stdout.strip(), "page: sent sev=info via bark")
 
 
 if __name__ == "__main__":

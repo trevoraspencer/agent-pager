@@ -16,20 +16,25 @@ Exit 0 means a backend accepted it or it was suppressed as a repeat, 1 means eve
 2 means bad usage. Accepted doesn't mean seen: neither backend reports that the human read it.
 
 Secrets are one file each, by default ~/.config/page/secrets/bark-key and ntfy-topic (mode 0600). A backend without a
-file is skipped. ~/.config/page/config.json is optional; see the README. A bad setting is reported and ignored, and the
-rest of the file still applies. A file that isn't valid JSON is ignored whole, so keep secrets at the default paths to
+file is skipped. If ~/.config/page/secrets/bark-enc-key exists, bark pushes are encrypted with it, and never go out in
+plain text while it is there. ~/.config/page/config.json is optional; see the README. A bad setting is reported and
+ignored, and the rest of the file still applies. A file that isn't valid JSON is ignored whole, so keep secrets at the default paths to
 stay reachable through that too. State that can't be used, or a lock held past 15 seconds, is reported and
 skipped, so that page goes out without suppression or the cap. $PAGE_CONFIG_DIR and $PAGE_STATE_DIR override the two
 directories.
 """
 import argparse
+import base64
 import contextlib
 import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
 import socket
+import stat
+import string
 import sys
 import time
 import urllib.error
@@ -37,7 +42,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.2.1"
+__version__ = "0.2.1+tspencer.1"
 
 MAX_CHARS = 240
 TIMEOUT_SECONDS = 10
@@ -69,12 +74,22 @@ DEFAULTS = {
     "windows": {"wake": 900, "info": 3600},
     "wake_cap_per_hour": 6,
     "backends": {
-        "bark": {"server": "https://api.day.app", "secret_file": "secrets/bark-key", "volume": 5},
+        "bark": {
+            "server": "https://api.day.app",
+            "secret_file": "secrets/bark-key",
+            "volume": 5,
+            "encrypt_key_file": "secrets/bark-enc-key",
+            "max_level": "critical",
+        },
         "ntfy": {"server": "https://ntfy.sh", "secret_file": "secrets/ntfy-topic"},
     },
 }
 SEVERITIES = ("wake", "info")
 RINGS_THROUGH_MUTE = {"bark"}
+# Lowest to highest. Only critical rings through mute and Do Not Disturb.
+BARK_LEVELS = ("active", "timeSensitive", "critical")
+AES_KEY_LENGTHS = (16, 24, 32)
+IV_CHARACTERS = string.ascii_letters + string.digits
 
 
 def config_dir():
@@ -110,12 +125,14 @@ def section(raw, name, problems):
 def backend_setting_problem(name, key, value):
     if key not in DEFAULTS["backends"][name]:
         return f"backend {name} has unknown key {key}"
-    if key in ("server", "secret_file") and not (isinstance(value, str) and value):
+    if key in ("server", "secret_file", "encrypt_key_file") and not (isinstance(value, str) and value):
         return f"bad {name} {key}"
     if key == "server" and not is_safe_server(value):
         return f"{name} server must use https, or http on this machine: the secret is in the URL"
     if key == "volume" and not (is_int(value, 0) and value <= 10):
         return f"bad {name} volume"
+    if key == "max_level" and value not in BARK_LEVELS:
+        return f"bad {name} max_level, use one of {list(BARK_LEVELS)}"
     return None
 
 
@@ -178,6 +195,102 @@ def secret(config, name):
         return None
 
 
+class EncryptionProblem(Exception):
+    """Its text names the problem and never holds the key, so it is safe to print."""
+
+
+def encryption_key(config):
+    """Returns (key bytes or None, warning or None). None with no warning means the file is absent, so bark is plain.
+    Raises EncryptionProblem when the file is there but can't be used: bark must then not send in plain text."""
+    path = config_dir() / Path(config["backends"]["bark"]["encrypt_key_file"]).expanduser()
+    try:
+        mode = path.stat().st_mode
+        text = path.read_text()
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError) as error:
+        raise EncryptionProblem(f"encryption key unusable: {type(error).__name__}") from None
+    # The Bark app uses the key's characters as the key bytes, so only printable ASCII keeps lengths equal.
+    key = text.rstrip("\r\n")
+    if len(key) not in AES_KEY_LENGTHS or not all("!" <= character <= "~" for character in key):
+        lengths = "/".join(map(str, AES_KEY_LENGTHS))
+        raise EncryptionProblem(f"encryption key unusable: needs {lengths} printable characters")
+    warning = "encryption key file is readable by other users" if stat.S_IMODE(mode) & 0o077 else None
+    return key.encode(), warning
+
+
+def _xtime(value):
+    value <<= 1
+    return (value ^ 0x11B) if value & 0x100 else value
+
+
+def _make_sbox():
+    sbox = [0x63] * 256
+    p = q = 1
+    while True:
+        p = (p ^ _xtime(p)) & 0xFF
+        q ^= q << 1
+        q ^= q << 2
+        q ^= q << 4
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        rotated = q
+        for shift in (1, 2, 3, 4):
+            rotated ^= ((q << shift) | (q >> (8 - shift))) & 0xFF
+        sbox[p] = rotated ^ 0x63
+        if p == 1:
+            return sbox
+
+
+SBOX = _make_sbox()
+
+
+def _round_keys(key):
+    words_in_key = len(key) // 4
+    rounds = words_in_key + 6
+    words = [list(key[4 * i:4 * i + 4]) for i in range(words_in_key)]
+    rcon = 1
+    for i in range(words_in_key, 4 * (rounds + 1)):
+        word = list(words[i - 1])
+        if i % words_in_key == 0:
+            word = [SBOX[b] for b in word[1:] + word[:1]]
+            word[0] ^= rcon
+            rcon = _xtime(rcon)
+        elif words_in_key > 6 and i % words_in_key == 4:
+            word = [SBOX[b] for b in word]
+        words.append([a ^ b for a, b in zip(words[i - words_in_key], word)])
+    return [sum(words[4 * r:4 * r + 4], []) for r in range(rounds + 1)]
+
+
+def _encrypt_block(round_keys, block):
+    state = [b ^ k for b, k in zip(block, round_keys[0])]
+    last = len(round_keys) - 1
+    for number in range(1, last + 1):
+        state = [SBOX[b] for b in state]
+        state = [state[(i + 4 * (i % 4)) % 16] for i in range(16)]
+        if number != last:
+            for c in range(0, 16, 4):
+                column = state[c:c + 4]
+                total = column[0] ^ column[1] ^ column[2] ^ column[3]
+                state[c:c + 4] = [column[j] ^ total ^ _xtime(column[j] ^ column[(j + 1) % 4]) for j in range(4)]
+        state = [b ^ k for b, k in zip(state, round_keys[number])]
+    return state
+
+
+def aes_cbc_encrypt(key, iv, data):
+    """AES-CBC with PKCS7 padding, as the Bark app decrypts it. Encrypt only: page never needs to decrypt."""
+    round_keys = _round_keys(key)
+    padding = 16 - len(data) % 16
+    data = data + bytes([padding]) * padding
+    previous = list(iv)
+    out = bytearray()
+    for start in range(0, len(data), 16):
+        previous = _encrypt_block(round_keys, [a ^ b for a, b in zip(data[start:start + 16], previous)])
+        out.extend(previous)
+    return bytes(out)
+
+
 def post(url, data, headers):
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     with OPENER.open(request, timeout=TIMEOUT_SECONDS) as response:
@@ -185,14 +298,33 @@ def post(url, data, headers):
 
 
 def send_bark(config, message, loud):
+    """Returns True if max_level kept a loud page from ringing."""
     settings = config["backends"]["bark"]
-    body = {"title": message["title"], "body": message["text"], "group": "page-" + message["sev"], "level": "active"}
-    if loud:
-        body.update(level="critical", volume=settings["volume"], call="1")
+    key, warning = encryption_key(config)
+    if warning:
+        print(f"page: bark {warning}", file=sys.stderr)
+    wanted = BARK_LEVELS.index("critical" if loud else "active")
+    level = BARK_LEVELS[min(wanted, BARK_LEVELS.index(settings["max_level"]))]
+    body = {"title": message["title"], "body": message["text"], "group": "page-" + message["sev"], "level": level}
+    if level == "critical":
+        body.update(volume=settings["volume"], call="1")
     if message["url"]:
         body["url"] = message["url"]
-    url = f"{settings['server'].rstrip('/')}/{secret(config, 'bark')}"
-    post(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    server = settings["server"].rstrip("/")
+    headers = {"Content-Type": "application/json"}
+    if key is None:
+        post(f"{server}/{secret(config, 'bark')}", json.dumps(body).encode(), headers)
+    else:
+        # The device key goes in the body, not the path, so it stays out of URL logs. Everything else is inside the
+        # ciphertext; the IV is new for each push.
+        iv = "".join(secrets.choice(IV_CHARACTERS) for _ in range(16))
+        try:
+            ciphertext = base64.b64encode(aes_cbc_encrypt(key, iv.encode(), json.dumps(body).encode())).decode()
+        except Exception:
+            raise EncryptionProblem("encryption failed") from None
+        payload = {"device_key": secret(config, "bark"), "ciphertext": ciphertext, "iv": iv}
+        post(f"{server}/push", json.dumps(payload).encode(), headers)
+    return loud and level != "critical"
 
 
 def send_ntfy(config, message, loud):
@@ -201,6 +333,7 @@ def send_ntfy(config, message, loud):
     if message["url"]:
         headers["Click"] = message["url"]
     post(f"{settings['server'].rstrip('/')}/{secret(config, 'ntfy')}", message["text"].encode(), headers)
+    return False
 
 
 BACKENDS = {"bark": send_bark, "ntfy": send_ntfy}
@@ -210,21 +343,23 @@ def failure_reason(error):
     """Names the failure without the error's text, which can contain a URL holding the secret."""
     if isinstance(error, urllib.error.HTTPError):
         return f"http {error.code}"
+    if isinstance(error, EncryptionProblem):
+        return str(error)
     return type(error).__name__
 
 
 def deliver(config, message, loud):
-    """Tries each set-up backend on the route in order. Returns (backend or None, failure reasons)."""
+    """Tries each set-up backend on the route in order. Returns (backend or None, failure reasons, level capped)."""
     failures = []
     for name in config["routes"][message["sev"]]:
         if not secret(config, name):
             continue
         try:
-            BACKENDS[name](config, message, loud)
-            return name, failures
+            capped = BACKENDS[name](config, message, loud)
+            return name, failures, capped
         except Exception as error:  # Any failure, such as a truncated response, moves on to the next backend.
             failures.append(f"{name}: {failure_reason(error)}")
-    return None, failures
+    return None, failures, False
 
 
 def is_entry(entry):
@@ -355,7 +490,7 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None):
             message["sev"] = "info"
             message["title"] = clean("wake cap: " + message["title"])
             loud = False
-        backend, failures = deliver(config, message, loud)
+        backend, failures, level_capped = deliver(config, message, loud)
         for failure in failures:
             print(f"page: {failure}", file=sys.stderr)
         if backend is None:
@@ -364,7 +499,7 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None):
         if lock:
             entries.append(
                 {"at": now, "key": key, "name": clean(dedupe) if dedupe else None, "window": window, "asked": sev,
-                 "sev": message["sev"], "rang": loud, "backend": backend, "source": source}
+                 "sev": message["sev"], "rang": loud and not level_capped, "backend": backend, "source": source}
             )
             try:
                 write_log(entries)
@@ -373,6 +508,8 @@ def run_page(sev, text, title, url, dedupe, window, source, loud=None):
     note = ""
     if capped:
         note = ", capped, did not ring"
+    elif level_capped:
+        note = ", level capped, did not ring"
     elif message["sev"] == "wake" and not loud:
         note = ", quiet"
     elif loud and backend not in RINGS_THROUGH_MUTE:
@@ -387,7 +524,20 @@ def run_status():
         print(f"config: {problem}")
     set_up = [name for name in BACKENDS if secret(config, name)]
     for name in BACKENDS:
-        print(f"{name}: {'set up' if name in set_up else 'no secret file'}")
+        line = f"{name}: {'set up' if name in set_up else 'no secret file'}"
+        if name == "bark":
+            try:
+                key, warning = encryption_key(config)
+                line += ", encrypted" if key else ", NOT encrypted"
+                if warning:
+                    line += f", {warning}"
+            except EncryptionProblem as problem:
+                line += f", {problem}, will not send"
+                if name in set_up:
+                    set_up.remove(name)
+            if config["backends"]["bark"]["max_level"] != "critical":
+                line += f", max level {config['backends']['bark']['max_level']}"
+        print(line)
     for entry in read_log()[-10:]:
         when = time.strftime("%m-%dT%H:%M:%SZ", time.gmtime(entry["at"]))
         source = f" source={entry['source']}" if entry.get("source") else ""
