@@ -27,7 +27,8 @@ See [Limits](#limits).
    chmod 600 ~/.config/page/secrets/bark-key
    ```
 
-3. Check it. The first command doesn't ring; the second really does:
+3. Check it. Neither command rings through mute: a `wake` only does that once you set `max_level` to `critical` (see
+   [Configuration](#configuration)), and then the second one really does:
 
    ```sh
    page test --sev wake
@@ -39,14 +40,44 @@ save the topic name to `~/.config/page/secrets/ntfy-topic` with mode 0600. Witho
 name of an ntfy.sh topic can read and post to it, so treat the name as a password.
 
 A backend with no secret file is skipped, so either one works alone. Bark is iPhone only, and `wake` won't ring through
-Do Not Disturb without it.
+Do Not Disturb without it and `"max_level": "critical"`.
+
+## Bark encryption
+
+Bark's app can decrypt pushes on the phone, so the Bark server and Apple's push service never see the text.
+
+1. In the Bark app, open Push Encryption, then Encryption Settings. Choose AES256, CBC and pkcs7. Enter a key of 32
+   letters and digits, and any 16 letters and digits as the IV (`page` sends its own IV with each push).
+2. Save the same key to `~/.config/page/secrets/bark-enc-key` with mode 0600.
+3. `page status` should say `bark: set up, encrypted`. Then run `page test` and check that the phone shows the text, not
+   `Decryption Failed`.
+
+While the key file is there, a Bark push carries only the device key, the ciphertext and a new random IV. The title,
+body, group, level and link are all inside the ciphertext. Bark's server still sees the device key, the time, the size
+and the sender's IP address, and Apple sees the time and the size.
+
+Bark reports `encryption key unusable` and sends nothing, so a page can't leak in plain text, when:
+
+- the key file can't be read, or the key isn't 16, 24 or 32 printable characters;
+- the key file is a broken symlink;
+- the config names `encrypt_key_file`, or sets `require_encryption`, and the file is missing.
+
+Only the default key file being absent, with nothing asking for encryption, sends Bark in plain text.
+
+ntfy is not encrypted. Set `"require_encryption": true` to stop using it, and plain Bark, entirely. Then `info` doesn't
+try ntfy first, and a Bark failure doesn't fall through to ntfy: the page fails with exit 1. A value other than `false`
+counts as on. If `config.json` isn't valid JSON, this setting is lost with the rest of the file. A key at the default
+path still encrypts Bark then, so if you rely on `require_encryption`, don't keep an ntfy topic file either.
+
+The encryption is AES-CBC with PKCS7 padding, written in plain Python so `page` keeps no dependencies. `page` only
+encrypts and never decrypts.
 
 ## Severity
 
 | Severity | Default route | On the phone |
 | --- | --- | --- |
 | `info` | ntfy, then Bark | A normal notification |
-| `wake` | Bark, then ntfy | Bark rings through mute and Do Not Disturb for 30 seconds; the ntfy fallback uses max priority, which we found showed as a normal notification on iOS, so its output says `may not have rung` |
+| `wake` | Bark, then ntfy | With `max_level` `critical`, Bark rings through mute and Do Not Disturb for 30 seconds; by default it's a normal notification. The ntfy fallback uses max priority, which we found showed as a normal notification on iOS, so its output says `may not have rung` |
 
 Keep `wake` to a short list of things worth waking someone for. Everything else is `info`.
 
@@ -86,18 +117,28 @@ you pass `--title` or `--source`, and `page test` always includes it.
   "routes": {"wake": ["bark", "ntfy"], "info": ["ntfy", "bark"]},
   "windows": {"wake": 900, "info": 3600},
   "wake_cap_per_hour": 6,
+  "require_encryption": false,
   "backends": {
-    "bark": {"server": "https://api.day.app", "secret_file": "secrets/bark-key", "volume": 5},
+    "bark": {
+      "server": "https://api.day.app", "secret_file": "secrets/bark-key", "volume": 5,
+      "encrypt_key_file": "secrets/bark-enc-key", "max_level": "active"
+    },
     "ntfy": {"server": "https://ntfy.sh", "secret_file": "secrets/ntfy-topic"}
   }
 }
 ```
 
-`secret_file` is relative to the config directory, or an absolute or `~` path. `server` lets you use a self-hosted Bark
-or ntfy server, over https, or http on the same machine, because the secret is part of the URL. A bad setting is reported
-and keeps its default, and the rest of the file still applies, so a bad edit can't silence a page. If the file isn't valid
-JSON, all of it is ignored, so a secret at a custom path won't be found until it's fixed: keep secrets at the default
-paths to stay reachable through that too. `page status` shows whether either has happened.
+`max_level` caps how loud a Bark push can be: `active` (the default), `timeSensitive` or `critical`. Below `critical`,
+a `wake` doesn't ring through mute or Do Not Disturb, says `level capped, did not ring`, and doesn't count toward the
+hourly wake cap. Only a valid `"critical"` in a readable config rings: a config that's missing, can't be read, isn't
+valid JSON or has a bad value stays at `active`.
+
+`secret_file` and `encrypt_key_file` are relative to the config directory, or an absolute or `~` path. `server` lets
+you use a self-hosted Bark or ntfy server, over https, or http on the same machine, because the secret is part of the
+URL. A bad setting is reported and keeps its default, and the rest of the file still applies, so a bad edit can't
+silence a page. If the file isn't valid JSON, all of it is ignored, so a secret at a custom path won't be found until
+it's fixed: keep secrets at the default paths to stay reachable through that too. `page status` shows whether either
+has happened.
 
 ## Agent skill
 
@@ -118,8 +159,8 @@ installer of its own. Use whatever installs skills on your host:
   separate check that doesn't depend on them.
 - **Limits are per host and per user account.** Two hosts noticing one outage will both ring.
 - **Public servers.** By default messages go through `api.day.app` and `ntfy.sh`. Bark's author [can see request
-  logs](https://github.com/Finb/Bark/blob/master/docs/en-us/privacy.md) on the public server, and `page` doesn't use
-  Bark's encryption yet. Both services may rate-limit you.
+  logs](https://github.com/Finb/Bark/blob/master/docs/en-us/privacy.md) on the public server. Use [Bark
+  encryption](#bark-encryption) to hide the text. Both services may rate-limit you.
 - **No proxy support.** `page` ignores proxy settings and connects directly.
 
 ## Tests
