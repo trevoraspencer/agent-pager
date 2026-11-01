@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly disk, RAID and thin pool check
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,29 @@
+{
+  "report": [
+    {
+      "lv": [
+        {
+          "vg_name": "vgtest",
+          "lv_name": "pool0",
+          "lv_attr": "twi-aotz--",
+          "data_percent": "95.10",
+          "metadata_percent": "3.10"
+        },
+        {
+          "vg_name": "vgtest",
+          "lv_name": "pool1",
+          "lv_attr": "twi-aotz--",
+          "data_percent": "55.00",
+          "metadata_percent": "2.50"
+        },
+        {
+          "vg_name": "vgtest",
+          "lv_name": "vm-1-disk-0",
+          "lv_attr": "Vwi-aotz--",
+          "data_percent": "40.00",
+          "metadata_percent": ""
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "json_format_version": [
+    1,
+    0
+  ],
+  "device": {
+    "name": "/dev/nvme9",
+    "type": "nvme",
+    "protocol": "NVMe"
+  },
+  "serial_number": "FAKESN-NVME-9",
+  "smart_status": {
+    "passed": true
+  },
+  "nvme_smart_health_information_log": {
+    "critical_warning": 0,
+    "percentage_used": 15,
+    "media_errors": 0
+  }
+}

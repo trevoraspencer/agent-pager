@@ -46,8 +46,9 @@ Do Not Disturb without it and `"max_level": "critical"`.
 
 Bark's app can decrypt pushes on the phone, so the Bark server and Apple's push service never see the text.
 
-1. In the Bark app, open Push Encryption, then Encryption Settings. Choose AES256, CBC and pkcs7. Enter a key of 32
-   letters and digits, and any 16 letters and digits as the IV (`page` sends its own IV with each push).
+1. In the Bark app, open Push Encryption, then Encryption Settings. Choose AES256, CBC and pkcs7, and enter a key of 32
+   letters and digits. If your version of the app also asks for an IV, enter any 16 letters and digits; `page` sends
+   its own IV with each push.
 2. Save the same key to `~/.config/page/secrets/bark-enc-key` with mode 0600.
 3. `page status` should say `bark: set up, encrypted`. Then run `page test` and check that the phone shows the text, not
    `Decryption Failed`.
@@ -170,6 +171,10 @@ python3 test_page.py
 ```
 
 They run the real CLI against a local fake server, so nothing reaches a phone or a public server.
+
+`contrib/pve-disk-health/` holds a separate hourly disk, RAID and thin pool check for Proxmox VE nodes. It sends
+through Proxmox's own notification system. See its [README](contrib/pve-disk-health/README.md); its tests run with
+`prove contrib/pve-disk-health/t/`.
 
 ## License
 

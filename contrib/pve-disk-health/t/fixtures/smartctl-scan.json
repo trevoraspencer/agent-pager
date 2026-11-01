@@ -1,0 +1,27 @@
+{
+  "json_format_version": [
+    1,
+    0
+  ],
+  "devices": [
+    {
+      "name": "/dev/bus/9",
+      "info_name": "/dev/bus/9 [megaraid_disk_04]",
+      "type": "megaraid,4",
+      "protocol": "SCSI"
+    },
+    {
+      "name": "/dev/nvme9",
+      "info_name": "/dev/nvme9",
+      "type": "nvme",
+      "protocol": "NVMe"
+    },
+    {
+      "name": "/dev/sdz",
+      "info_name": "/dev/sdz",
+      "type": "scsi",
+      "protocol": "SCSI",
+      "open_error": "DELL or MegaRaid controller, please try adding '-d megaraid,N'"
+    }
+  ]
+}

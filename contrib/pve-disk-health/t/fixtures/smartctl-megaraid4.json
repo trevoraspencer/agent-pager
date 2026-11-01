@@ -1,0 +1,27 @@
+{
+  "json_format_version": [
+    1,
+    0
+  ],
+  "device": {
+    "name": "/dev/bus/9",
+    "type": "megaraid,4",
+    "protocol": "SCSI"
+  },
+  "serial_number": "FAKESN-SMART-4",
+  "smart_status": {
+    "passed": true
+  },
+  "scsi_grown_defect_list": 88,
+  "scsi_error_counter_log": {
+    "read": {
+      "total_uncorrected_errors": 210
+    },
+    "write": {
+      "total_uncorrected_errors": 0
+    },
+    "verify": {
+      "total_uncorrected_errors": 40
+    }
+  }
+}

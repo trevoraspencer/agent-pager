@@ -1,0 +1,47 @@
+{
+  "Controllers": [
+    {
+      "Command Status": {
+        "CLI Version": "0.0.0 Fake",
+        "Controller": 0,
+        "Status": "Success",
+        "Description": "None"
+      },
+      "Response Data": {
+        "/c0/v0": [
+          {
+            "DG/VD": "0/0",
+            "TYPE": "RAID10",
+            "State": "Dgrd",
+            "Access": "RW",
+            "Consist": "No",
+            "Cache": "RWBD",
+            "Cac": "-",
+            "sCC": "ON",
+            "Size": "1.0 TB",
+            "Name": "FAKE-VD-A"
+          }
+        ],
+        "PDs for VD 0": [
+          {
+            "EID:Slt": "252:0",
+            "DID": 10,
+            "State": "Onln"
+          }
+        ],
+        "/c0/v1": [
+          {
+            "DG/VD": "1/1",
+            "TYPE": "RAID5",
+            "State": "Optl",
+            "Access": "RW",
+            "Consist": "Yes",
+            "Cache": "RWBD",
+            "Size": "9.0 TB",
+            "Name": "FAKE-VD-B"
+          }
+        ]
+      }
+    }
+  ]
+}

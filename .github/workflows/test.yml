@@ -19,3 +19,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python test_page.py
+  pve-disk-health:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: perl -c contrib/pve-disk-health/pve-disk-health
+      - run: prove -v contrib/pve-disk-health/t/

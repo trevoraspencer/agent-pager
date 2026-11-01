@@ -1,0 +1,34 @@
+# /etc/pve-disk-health.conf (optional). Lines are "key = value". Lines starting with # are ignored.
+# Every key is optional; the value shown is the built-in default.
+
+# Page again when an error counter (media, other, grown defects, uncorrected) rises by this much
+# since the last push for that drive. Any rise from 0 always pages.
+#counter_step = 10
+
+# Thin pool data use: page at this percent, then again at every further step.
+#thin_data_warn = 90
+#thin_data_step = 2
+
+# Thin pool metadata use: page at this percent.
+#thin_meta_warn = 80
+
+# NVMe "percentage used" (wear): page at this percent.
+#nvme_used_warn = 90
+
+# Tools. perccli is optional; without it, PERC/MegaRAID volumes are not checked.
+#perccli = /opt/MegaRAID/perccli/perccli64
+#smartctl = smartctl
+#lvs = lvs
+#cmd_timeout = 60
+
+# Stop collecting after this many seconds, treat the rest as incomplete, and still notify.
+# Keep it below TimeoutStartSec in the service (300).
+#deadline = 200
+
+#state_file = /var/lib/pve-disk-health/state.json
+# Used only when state_file cannot be written, so the same problem is not sent every hour.
+#fallback_state_file = /run/pve-disk-health/state.json
+
+# Finding keys to skip, separated by spaces or commas. A trailing * matches a prefix.
+# Run "pve-disk-health --show" to see the keys. Example:
+#ignore = thin:somevg/somepool smart:/dev/nvme0:*
