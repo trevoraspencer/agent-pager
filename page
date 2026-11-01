@@ -7,20 +7,21 @@
 
 A message that is only the word status or test needs a separator: page -- status
 
-Severity decides the route. By default wake tries bark, then ntfy, and rings through mute and Do Not Disturb on bark.
-info goes to ntfy, then bark. Repeats of a key inside its window are suppressed (wake 15 minutes, info 1 hour). A failed
-send is not recorded, so a retry goes out. Past 6 wakes an hour, further wakes go out as info: a looping agent can't
-keep ringing the phone.
+Severity decides the route. By default wake tries bark, then ntfy, and info goes to ntfy, then bark. A wake rings
+through mute and Do Not Disturb on bark only if the config sets bark's max_level to critical. Repeats of a key inside
+its window are suppressed (wake 15 minutes, info 1 hour). A failed send is not recorded, so a retry goes out. Past 6
+wakes an hour, further wakes go out as info: a looping agent can't keep ringing the phone.
 
 Exit 0 means a backend accepted it or it was suppressed as a repeat, 1 means every backend failed or none is set up,
 2 means bad usage. Accepted doesn't mean seen: neither backend reports that the human read it.
 
 Secrets are one file each, by default ~/.config/page/secrets/bark-key and ntfy-topic (mode 0600). A backend without a
 file is skipped. If ~/.config/page/secrets/bark-enc-key exists, bark pushes are encrypted with it, and never go out in
-plain text while it is there. ~/.config/page/config.json is optional; see the README. A bad setting is reported and
-ignored, and the rest of the file still applies. A file that isn't valid JSON is ignored whole, so keep secrets at the default paths to
-stay reachable through that too. State that can't be used, or a lock held past 15 seconds, is reported and
-skipped, so that page goes out without suppression or the cap. $PAGE_CONFIG_DIR and $PAGE_STATE_DIR override the two
+plain text while it is there. With require_encryption on, plain-text backends are not used at all.
+~/.config/page/config.json is optional; see the README. A bad setting is reported and ignored, and the rest of the file
+still applies. A file that isn't valid JSON is ignored whole, so keep secrets at the default paths to stay reachable
+through that too. State that can't be used, or a lock held past 15 seconds, is reported and skipped, so that page goes
+out without suppression or the cap. $PAGE_CONFIG_DIR and $PAGE_STATE_DIR override the two
 directories.
 """
 import argparse
@@ -73,19 +74,21 @@ DEFAULTS = {
     "routes": {"wake": ["bark", "ntfy"], "info": ["ntfy", "bark"]},
     "windows": {"wake": 900, "info": 3600},
     "wake_cap_per_hour": 6,
+    "require_encryption": False,
     "backends": {
         "bark": {
             "server": "https://api.day.app",
             "secret_file": "secrets/bark-key",
             "volume": 5,
             "encrypt_key_file": "secrets/bark-enc-key",
-            "max_level": "critical",
+            "max_level": "active",
         },
         "ntfy": {"server": "https://ntfy.sh", "secret_file": "secrets/ntfy-topic"},
     },
 }
 SEVERITIES = ("wake", "info")
 RINGS_THROUGH_MUTE = {"bark"}
+ENCRYPTING_BACKENDS = {"bark"}
 # Lowest to highest. Only critical rings through mute and Do Not Disturb.
 BARK_LEVELS = ("active", "timeSensitive", "critical")
 AES_KEY_LENGTHS = (16, 24, 32)
@@ -162,6 +165,11 @@ def validate(raw):
             config["wake_cap_per_hour"] = raw["wake_cap_per_hour"]
         else:
             problems.append("bad wake_cap_per_hour")
+    if "require_encryption" in raw:
+        # A value that isn't a boolean is taken as on: a typo here must not let a page out in plain text.
+        config["require_encryption"] = raw["require_encryption"] is not False
+        if not isinstance(raw["require_encryption"], bool):
+            problems.append("bad require_encryption, treated as true")
     for name, settings in section(raw, "backends", problems).items():
         if name not in BACKENDS or not isinstance(settings, dict):
             problems.append(f"bad backend {name}")
@@ -172,6 +180,9 @@ def validate(raw):
                 problems.append(problem)
             else:
                 config["backends"][name][key] = value
+        # Naming a key file, even a bad name, asks for encryption, so a missing file must not mean plain text.
+        if name == "bark" and "encrypt_key_file" in settings:
+            config["_encryption_requested"] = True
     return config, problems
 
 
@@ -199,14 +210,23 @@ class EncryptionProblem(Exception):
     """Its text names the problem and never holds the key, so it is safe to print."""
 
 
+def encryption_requested(config):
+    return config["require_encryption"] or config.get("_encryption_requested", False)
+
+
 def encryption_key(config):
-    """Returns (key bytes or None, warning or None). None with no warning means the file is absent, so bark is plain.
-    Raises EncryptionProblem when the file is there but can't be used: bark must then not send in plain text."""
+    """Returns (key bytes or None, warning or None). None means encryption isn't set up: the default key file is absent
+    and nothing asked for it, so bark is plain. Raises EncryptionProblem when bark must not send in plain text: the key
+    can't be used, a key file was named or required but is missing, or the key file is a dangling symlink."""
     path = config_dir() / Path(config["backends"]["bark"]["encrypt_key_file"]).expanduser()
     try:
         mode = path.stat().st_mode
         text = path.read_text()
     except FileNotFoundError:
+        if path.is_symlink():
+            raise EncryptionProblem("encryption key unusable: the key file is a broken link") from None
+        if encryption_requested(config):
+            raise EncryptionProblem("encryption key unusable: asked for, but the key file is missing") from None
         return None, None
     except (OSError, ValueError) as error:
         raise EncryptionProblem(f"encryption key unusable: {type(error).__name__}") from None
@@ -353,6 +373,9 @@ def deliver(config, message, loud):
     failures = []
     for name in config["routes"][message["sev"]]:
         if not secret(config, name):
+            continue
+        if config["require_encryption"] and name not in ENCRYPTING_BACKENDS:
+            failures.append(f"{name}: blocked, require_encryption is on")
             continue
         try:
             capped = BACKENDS[name](config, message, loud)
@@ -522,6 +545,8 @@ def run_status():
     config, problem = load_config()
     if problem:
         print(f"config: {problem}")
+    if config["require_encryption"]:
+        print("require_encryption: on, plain-text backends are blocked")
     set_up = [name for name in BACKENDS if secret(config, name)]
     for name in BACKENDS:
         line = f"{name}: {'set up' if name in set_up else 'no secret file'}"
@@ -535,8 +560,10 @@ def run_status():
                 line += f", {problem}, will not send"
                 if name in set_up:
                     set_up.remove(name)
-            if config["backends"]["bark"]["max_level"] != "critical":
-                line += f", max level {config['backends']['bark']['max_level']}"
+            line += f", max level {config['backends']['bark']['max_level']}"
+        elif name in set_up and config["require_encryption"]:
+            line += ", blocked by require_encryption"
+            set_up.remove(name)
         print(line)
     for entry in read_log()[-10:]:
         when = time.strftime("%m-%dT%H:%M:%SZ", time.gmtime(entry["at"]))

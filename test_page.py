@@ -52,6 +52,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class ServerTest(unittest.TestCase):
+    bark_settings = {}
+
     def setUp(self):
         self.server = FakeServer()
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -70,7 +72,10 @@ class ServerTest(unittest.TestCase):
 
     def write_config(self, config):
         """Points both backends at the fake server, then applies the test's own settings over that."""
-        backends = {"bark": {"server": f"{self.base_url()}/bark"}, "ntfy": {"server": f"{self.base_url()}/ntfy"}}
+        backends = {
+            "bark": {"server": f"{self.base_url()}/bark", **self.bark_settings},
+            "ntfy": {"server": f"{self.base_url()}/ntfy"},
+        }
         for name, settings in config.pop("backends", {}).items():
             backends[name].update(settings)
         (self.root / "config/config.json").write_text(json.dumps({"backends": backends, **config}))
@@ -91,6 +96,8 @@ class ServerTest(unittest.TestCase):
 
 
 class PageTest(ServerTest):
+    # These tests cover ringing, so they opt in to critical the way a config would.
+    bark_settings = {"max_level": "critical"}
 
     def test_this_machines_own_name_stays_readable(self):
         name = "DavidMacSudioM1s-Mac-Studio"
@@ -498,6 +505,12 @@ class AesTest(unittest.TestCase):
         expected = "d3QhjQjP5majvNt5CjsvFWwqqj2gKl96RFj5OO+u6ynTt7lkyigDYNA3abnnCLpr"
         self.assertEqual(base64.b64encode(out).decode(), expected)
 
+    def test_nist_sp_800_38a_cbc_aes_192(self):
+        key = bytes.fromhex("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b")
+        plain = bytes.fromhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
+        out = self.module.aes_cbc_encrypt(key, bytes(range(16)), plain)
+        self.assertEqual(out[:32].hex(), "4f021db243bc633d7178183a9fa071e8b4d9ada9ad7dedf4e5e738763f69145a")
+
     @unittest.skipUnless(shutil.which("openssl"), "openssl not installed")
     def test_openssl_decrypts_every_key_size(self):
         for size in (16, 24, 32):
@@ -549,6 +562,7 @@ class EncryptedBarkTest(ServerTest):
 
     @unittest.skipUnless(shutil.which("openssl"), "openssl not installed")
     def test_a_wake_rings_from_inside_the_ciphertext(self):
+        self.write_config({"backends": {"bark": {"max_level": "critical"}}})
         self.page("--sev", "wake", "lead is down")
         plain = self.decrypted(self.sent()[1])
         self.assertEqual((plain["level"], plain["call"], plain["volume"]), ("critical", "1", 5))
@@ -607,8 +621,120 @@ class EncryptedBarkTest(ServerTest):
         (self.root / "config/secrets/bark-enc-key").unlink()
         self.assertIn("bark: set up, NOT encrypted", self.page("status").stdout)
 
+    def test_a_named_key_file_that_is_missing_never_falls_back_to_plain_text(self):
+        self.write_config({"backends": {"bark": {"encrypt_key_file": str(self.root / "not-there")}}})
+        result = self.page("backup failed")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("bark: encryption key unusable: asked for, but the key file is missing", result.stderr)
+        self.assertEqual(self.server.requests, [])
+        self.assertIn("will not send", self.page("status").stdout)
+
+    def test_a_badly_named_key_file_still_counts_as_asking_for_encryption(self):
+        (self.root / "config/secrets/bark-enc-key").unlink()
+        self.write_config({"backends": {"bark": {"encrypt_key_file": ""}}})
+        result = self.page("backup failed")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.server.requests, [])
+
+    def test_a_dangling_key_link_never_falls_back_to_plain_text(self):
+        key_file = self.root / "config/secrets/bark-enc-key"
+        key_file.unlink()
+        key_file.symlink_to(self.root / "gone")
+        result = self.page("backup failed")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("broken link", result.stderr)
+        self.assertEqual(self.server.requests, [])
+
+
+class RequireEncryptionTest(ServerTest):
+    def setUp(self):
+        super().setUp()
+        self.set_secret("bark-enc-key", ENC_KEY)
+        os.chmod(self.root / "config/secrets/bark-enc-key", 0o600)
+        self.write_config({"require_encryption": True})
+
+    def test_info_skips_ntfy_and_goes_encrypted_to_bark(self):
+        result = self.page("build finished")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.backends(), ["bark"])
+        self.assertEqual(sorted(json.loads(self.server.requests[0]["body"])), ["ciphertext", "device_key", "iv"])
+        self.assertIn("ntfy: blocked, require_encryption is on", result.stderr)
+
+    def test_a_bark_failure_does_not_fall_through_to_ntfy(self):
+        for name, breaking in (
+            ("bad key", lambda: self.set_secret("bark-enc-key", "tooshort")),
+            ("missing key", lambda: (self.root / "config/secrets/bark-enc-key").unlink()),
+            ("server error", lambda: self.server.failing.add("bark")),
+        ):
+            with self.subTest(name=name):
+                self.setUp()
+                breaking()
+                for sev in ("wake", "info"):
+                    result = self.page("--sev", sev, "--window", "0", "lead is down")
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("ntfy: blocked", result.stderr)
+                self.assertNotIn("ntfy", self.backends())
+
+    def test_status_shows_the_block_and_exits_by_what_can_send(self):
+        status = self.page("status")
+        self.assertEqual(status.returncode, 0)
+        self.assertIn("require_encryption: on", status.stdout)
+        self.assertIn("ntfy: set up, blocked by require_encryption", status.stdout)
+        self.set_secret("bark-enc-key", "tooshort")
+        self.assertEqual(self.page("status").returncode, 1)
+
+    def test_a_value_that_is_not_a_boolean_counts_as_on(self):
+        self.write_config({"require_encryption": "yes"})
+        (self.root / "config/secrets/bark-enc-key").unlink()
+        result = self.page("build finished")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("treated as true", result.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_false_keeps_plain_backends(self):
+        self.write_config({"require_encryption": False})
+        self.assertEqual(self.page("build finished").returncode, 0)
+        self.assertEqual(self.backends(), ["ntfy"])
+
 
 class MaxLevelTest(ServerTest):
+    def wake_level(self):
+        self.page("--sev", "wake", "--window", "0", "lead is down")
+        return json.loads(self.server.requests[-1]["body"])
+
+    def test_the_default_does_not_ring(self):
+        body = self.wake_level()
+        self.assertEqual(body["level"], "active")
+        self.assertNotIn("call", body)
+
+    def test_only_an_explicit_critical_rings(self):
+        self.write_config({"backends": {"bark": {"max_level": "critical"}}})
+        body = self.wake_level()
+        self.assertEqual((body["level"], body["call"]), ("critical", "1"))
+
+    def test_a_config_that_cannot_be_used_does_not_ring(self):
+        # Status only: a page from a config that can't be used would go to the default public server.
+        cases = {
+            "invalid json": '{"backends": {"bark": {"max_level": "critical"',
+            "bad value": json.dumps({"backends": {"bark": {"server": f"{self.base_url()}/bark", "max_level": "loud"}}}),
+            "wrong type": json.dumps({"backends": {"bark": {"server": f"{self.base_url()}/bark", "max_level": 3}}}),
+        }
+        for name, text in cases.items():
+            with self.subTest(name=name):
+                (self.root / "config/config.json").write_text(text)
+                self.assertIn("max level active", self.page("status").stdout)
+        (self.root / "config/config.json").write_text(json.dumps({"backends": {"bark": {"max_level": "critical"}}}))
+        os.chmod(self.root / "config/config.json", 0)
+        self.addCleanup(os.chmod, self.root / "config/config.json", 0o600)
+        status = self.page("status").stdout
+        self.assertIn("ignored", status)
+        self.assertIn("max level active", status)
+
+    def test_a_bad_value_still_sends_at_active(self):
+        self.write_config({"backends": {"bark": {"max_level": "loud"}}})
+        result = self.page("--sev", "wake", "lead is down")
+        self.assertIn("bad bark max_level", result.stderr)
+        self.assertEqual(json.loads(self.server.requests[0]["body"])["level"], "active")
     def test_a_capped_wake_does_not_ring_or_use_up_the_wake_cap(self):
         self.write_config({"wake_cap_per_hour": 1, "backends": {"bark": {"max_level": "active"}}})
         first = self.page("--sev", "wake", "lead is down")
