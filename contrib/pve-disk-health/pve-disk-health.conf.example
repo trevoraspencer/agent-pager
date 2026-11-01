@@ -21,7 +21,13 @@
 #lvs = lvs
 #cmd_timeout = 60
 
+# Stop collecting after this many seconds, treat the rest as incomplete, and still notify.
+# Keep it below TimeoutStartSec in the service (300).
+#deadline = 200
+
 #state_file = /var/lib/pve-disk-health/state.json
+# Used only when state_file cannot be written, so the same problem is not sent every hour.
+#fallback_state_file = /run/pve-disk-health/state.json
 
 # Finding keys to skip, separated by spaces or commas. A trailing * matches a prefix.
 # Run "pve-disk-health --show" to see the keys. Example:

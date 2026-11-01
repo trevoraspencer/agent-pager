@@ -11,6 +11,8 @@ StateDirectoryMode=0700
 WorkingDirectory=/var/lib/pve-disk-health
 Nice=10
 IOSchedulingClass=idle
+# The checker stops collecting at its own deadline (200 s by default) and still notifies,
+# so keep this above that deadline.
 TimeoutStartSec=300
 # Read-only /usr, /boot and /etc. Not "strict": LVM needs its lock files under /run,
 # and the mail target needs the Postfix spool.
