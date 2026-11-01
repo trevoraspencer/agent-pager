@@ -645,9 +645,6 @@ sub main {
     my $cur = $ctx->{findings};
     if ($pstatus eq 'corrupt' || $pstatus eq 'unreadable') {
         $cur->{'check:state'} = finding(rank => 1, state => "state file $pstatus; started a new baseline");
-        # Keep the bad file for a look later; the next save writes a fresh one.
-        rename($cfg->{state_file}, "$cfg->{state_file}.bad")
-            if $pstatus eq 'corrupt' && !$o{show} && !$o{'dry-run'};
     }
 
     if ($o{'accept-inventory'}) {
@@ -701,6 +698,10 @@ sub main {
         print "saved the baseline without a notice (" . scalar(keys %$cur) . " findings)\n";
     }
 
+    # Keep the corrupt file in place until its alert is delivered, so a failed
+    # notification is retried rather than mistaken for a missing first-run state.
+    rename($cfg->{state_file}, "$cfg->{state_file}.bad")
+        if $pstatus eq 'corrupt' && $sent_error;
     my $state = { findings => $next, inventory => $inv };
     if (!eval { save_state($cfg->{state_file}, $state); 1 }) {
         my $err = $@;

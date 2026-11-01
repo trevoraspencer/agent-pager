@@ -109,7 +109,7 @@ for f in pve-disk-health pve-disk-health.service pve-disk-health.timer; do
     "https://raw.githubusercontent.com/trevoraspencer/agent-pager/$c/contrib/pve-disk-health/$f"
 done
 sha256sum --strict -c - <<'SUMS'
-cacc4db7b9a0a858d90c3b1cd83617d6146681abda1cd5ee3fcd7919a71d4b8c  pve-disk-health
+824c381e759d8db6711a18cd6666f8c37ff52b576fd6e97279ed65fa4ae8af9e  pve-disk-health
 f367c0cb985c1c2c4ad50eaa5d4b4a8ef80c7b206cae4a0ab17628b7ab6f3486  pve-disk-health.service
 2ac8ffc02f35b6f44cca69f98bd83976947c888b37a421aa5f08530af6c976ba  pve-disk-health.timer
 SUMS

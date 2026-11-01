@@ -348,6 +348,29 @@ is(errors(), 0, 'after the rebuild nothing pages again');
 like($out, qr/cleared: check:state/, 'the corrupt-state finding clears');
 
 fresh();
+unlink "$state.bad";
+open($sfh, '>', $state) or die;
+print $sfh "{not json";
+close($sfh);
+# Isolate the state fault: no hardware faults should trigger the retry for us.
+{
+local $PVEDiskHealth::COLLECTORS{perc} = sub {};
+local $PVEDiskHealth::COLLECTORS{smart} = sub {};
+local $PVEDiskHealth::COLLECTORS{thin} = sub {};
+$notify_dies = 1;
+($out, $rc) = run_check();
+is($rc, 1, 'a corrupt-state alert that cannot be sent exits nonzero');
+ok(-e $state && !-e "$state.bad", 'corrupt state stays in place until its alert is delivered');
+is((PVEDiskHealth::load_state($state))[1], 'corrupt', 'failed send does not replace corrupt state');
+$notify_dies = 0;
+($out, $rc) = run_check('--baseline-quiet');
+is($rc, 0, 'rerun after failed corrupt-state notification succeeds');
+is(errors(), 1, 'corrupt-state alert retries even with baseline-quiet');
+like($out, qr/check:state: new/, 'retry reports the pending corruption');
+ok(-e "$state.bad", 'bad state is retained after successful delivery');
+}
+
+fresh();
 my $sdir = dirname($state);
 chmod 0500, $sdir;
 pd2()->{'Media Error Count'} = 200;
